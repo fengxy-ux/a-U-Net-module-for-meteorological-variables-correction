@@ -1,0 +1,53 @@
+import numpy as np
+import random
+
+
+def temporal_average_augmentation(data, num_samples=1000, ratio=0.9):
+    """
+    Temporal data augmentation by random averaging.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Input array with shape (time, lat, lon)
+
+    num_samples : int
+        Number of augmented samples to generate
+
+    ratio : float
+        Fraction of time steps used for each sample (default 0.9)
+
+    Returns
+    -------
+    np.ndarray
+        Augmented samples with shape (num_samples, lat, lon)
+    """
+
+    time_steps = data.shape[0]
+    sample_size = int(time_steps * ratio)
+
+    samples = []
+
+    for _ in range(num_samples):
+
+        idx = random.sample(range(time_steps), sample_size)
+
+        avg_sample = np.mean(data[idx, :, :], axis=0)
+
+        samples.append(avg_sample)
+
+    return np.array(samples)
+
+
+if __name__ == "__main__":
+
+    # example usage
+    dummy_data = np.random.rand(240, 32, 32)  # (time, lat, lon) #shape
+
+    augmented = temporal_average_augmentation(
+        dummy_data,
+        num_samples=1000,
+        ratio=0.9
+    )
+
+    print("Augmented shape:", augmented.shape)
