@@ -1,0 +1,254 @@
+"""
+Build target dataset from ERA5 data.
+
+Pipeline
+--------
+1. Load ERA5 variable
+2. Crop spatial region
+3. Select target time window
+4. Compute climatology (mean/std)
+5. Z-score normalization
+6. Average each year as one sample
+7. Global normalization
+8. Save NetCDF dataset
+"""
+
+import os
+import argparse
+import logging
+import numpy as np
+import xarray as xr
+from tqdm import tqdm
+
+
+# =========================
+# Logging
+# =========================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =========================
+# Helper functions
+# =========================
+
+def load_target_data(path, var_name,
+                     lat_min, lat_max,
+                     lon_min, lon_max):
+
+    ds = xr.open_dataset(path, engine="netcdf4")
+
+    # 时间筛选
+    time_mask = (
+        ((ds["valid_time"].dt.month == m1) & (ds["valid_time"].dt.day >= n1)) |
+        ((ds["valid_time"].dt.month == m2) & (ds["valid_time"].dt.day <= n2))
+    )
+
+    ds = ds.sel(valid_time=time_mask)
+
+    # 空间裁剪
+    ds = ds.sel(
+        latitude=slice(lat_max, lat_min),
+        longitude=slice(lon_min, lon_max)
+    )
+
+    if var_name not in ds.variables:
+        raise ValueError(f"{var_name} not found in dataset")
+
+    data = ds[var_name].values - 273.15  # Kelvin → Celsius
+
+    return data, ds
+
+
+def compute_climatology(years, data_dir, var_name,
+                        lat_min, lat_max, lon_min, lon_max):
+
+    clim_data = []
+
+    for year in tqdm(years, desc="Computing climatology"):
+
+        file_path = os.path.join(
+            data_dir,
+            f"ERA5_{var_name}_{year}.nc"
+        )
+
+        if not os.path.exists(file_path):
+            logger.warning(f"Missing {file_path}")
+            continue
+
+        try:
+
+            data, _ = load_target_data(
+                file_path, var_name,
+                lat_min, lat_max,
+                lon_min, lon_max
+            )
+
+            clim_data.append(data)
+
+        except Exception as e:
+            logger.error(f"{year} failed: {e}")
+
+    clim_data = np.concatenate(clim_data, axis=0)
+
+    clim_mean = np.mean(clim_data, axis=0)
+    clim_std = np.std(clim_data, axis=0)
+
+    clim_std[clim_std == 0] = 1e-6
+
+    logger.info(
+        f"Climatology mean range: {clim_mean.min():.3f} ~ {clim_mean.max():.3f}"
+    )
+
+    logger.info(
+        f"Climatology std range: {clim_std.min():.3f} ~ {clim_std.max():.3f}"
+    )
+
+    return clim_mean, clim_std
+
+
+# =========================
+# Build samples
+# =========================
+
+def build_samples(years, data_dir, var_name,
+                  lat_min, lat_max, lon_min, lon_max,
+                  clim_mean, clim_std):
+
+    samples = []
+
+    latitudes = None
+    longitudes = None
+
+    for year in tqdm(years, desc="Building samples"):
+
+        file_path = os.path.join(
+            data_dir,
+            f"ERA5_{var_name}_{year}.nc"
+        )
+
+        if not os.path.exists(file_path):
+            continue
+
+        try:
+
+            data, ds = load_target_data(
+                file_path, var_name,
+                lat_min, lat_max,
+                lon_min, lon_max
+            )
+
+            if latitudes is None:
+                latitudes = ds["latitude"].values
+                longitudes = ds["longitude"].values
+
+            # Z-score normalization
+            data_standardized = (data - clim_mean) / clim_std
+
+            # yearly mean sample
+            avg_sample = np.mean(data_standardized, axis=0)
+
+            samples.append(avg_sample)
+
+        except Exception as e:
+            logger.error(f"{year} failed: {e}")
+
+    samples = np.array(samples)
+
+    # global normalization
+    overall_mean = np.mean(samples)
+    overall_std = np.std(samples)
+
+    logger.info(
+        f"Before global normalization: mean={overall_mean:.3f}, std={overall_std:.3f}"
+    )
+
+    if overall_std < 1e-6:
+        overall_std = 1e-6
+
+    samples = (samples - overall_mean) / overall_std
+
+    logger.info(
+        f"After normalization: mean={np.mean(samples):.3f}, std={np.std(samples):.3f}"
+    )
+
+    return samples, latitudes, longitudes
+
+
+# =========================
+# Main
+# =========================
+
+def main():
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--data_dir", default="./data/target")
+    parser.add_argument("--output_dir", default="./output")
+
+    parser.add_argument("--var_name", default="target_var")
+
+    parser.add_argument("--start_year", type=int, default=year1)
+    parser.add_argument("--end_year", type=int, default=year2)
+
+    parser.add_argument("--lat_min", type=float, default=lat1)
+    parser.add_argument("--lat_max", type=float, default=lat2)
+
+    parser.add_argument("--lon_min", type=float, default=lon1)
+    parser.add_argument("--lon_max", type=float, default=lon2)
+
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    years = list(range(args.start_year, args.end_year + 1))
+
+    logger.info("Computing climatology")
+
+    clim_mean, clim_std = compute_climatology(
+        years,
+        args.data_dir,
+        args.var_name,
+        args.lat_min, args.lat_max,
+        args.lon_min, args.lon_max
+    )
+
+    logger.info("Building samples")
+
+    samples, lat, lon = build_samples(
+        years,
+        args.data_dir,
+        args.var_name,
+        args.lat_min, args.lat_max,
+        args.lon_min, args.lon_max,
+        clim_mean, clim_std
+    )
+
+    output_file = os.path.join(args.output_dir, "target_dataset.nc")
+
+    ds = xr.Dataset(
+        {
+            "target": (
+                ["sample", "lat", "lon"],
+                samples.astype(np.float32)
+            )
+        },
+        coords={
+            "sample": np.arange(samples.shape[0]),
+            "lat": lat,
+            "lon": lon
+        }
+    )
+
+    ds.to_netcdf(output_file)
+
+    logger.info(f"Saved dataset → {output_file}")
+
+
+if __name__ == "__main__":
+    main()
