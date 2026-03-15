@@ -98,9 +98,9 @@ def compute_climatology(years, dir1, dir2,
             ds = xr.open_dataset(path1)
 
             time_mask = (
-                (ds.time.dt.month == 8) &
-                (ds.time.dt.day >= 11) &
-                (ds.time.dt.day <= 20)
+                (ds.time.dt.month == m) &
+                (ds.time.dt.day >= n1) &
+                (ds.time.dt.day <= n2)
             )
 
             data1 = data1[:, time_mask.values]
