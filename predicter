@@ -1,0 +1,275 @@
+"""
+Build predictor dataset from S2S model outputs.
+
+Steps
+-----
+1. Load NetCDF predictor variables
+2. Crop to target spatial region
+3. Compute climatological mean and std
+4. Normalize predictors
+5. Save predictor dataset and normalization parameters
+"""
+
+import os
+import argparse
+import logging
+import numpy as np
+import xarray as xr
+from tqdm import tqdm
+
+
+# =============================
+# Logging
+# =============================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =============================
+# Helper functions
+# =============================
+
+def load_and_crop(path, var_name, lat_min, lat_max, lon_min, lon_max):
+    """
+    Load NetCDF variable and crop region.
+    """
+
+    ds = xr.open_dataset(path)
+
+    ds_crop = ds.sel(
+        latitude=slice(lat_max, lat_min),
+        longitude=slice(lon_min, lon_max)
+    )
+
+    data = ds_crop[var_name].transpose(
+        "time", "number", "latitude", "longitude"
+    ).values
+
+    return np.transpose(data, (1, 0, 2, 3))  # (number,time,lat,lon)
+
+
+def compute_mean_std(data_list):
+    """
+    Compute climatological mean and standard deviation.
+    """
+
+    all_data = np.concatenate(data_list, axis=0)
+
+    mean = np.mean(all_data, axis=0)
+    std = np.std(all_data, axis=0)
+
+    std[std == 0] = 1e-6
+
+    return mean, std
+
+
+# =============================
+# Climatology computation
+# =============================
+
+def compute_climatology(years, dir1, dir2,
+                        lat_min, lat_max, lon_min, lon_max):
+
+    all_var1 = []
+    all_var2 = []
+
+    for year in tqdm(years, desc="Computing climatology"):
+
+        path1 = os.path.join(dir1, str(year), f"model_{year}_var1.nc")
+        path2 = os.path.join(dir2, str(year), f"model_{year}_var2.nc")
+
+        if not os.path.exists(path1) or not os.path.exists(path2):
+            logger.warning(f"Missing data for {year}")
+            continue
+
+        try:
+
+            data1 = load_and_crop(path1, "var1",
+                                  lat_min, lat_max, lon_min, lon_max)
+
+            data2 = load_and_crop(path2, "var2",
+                                  lat_min, lat_max, lon_min, lon_max)
+
+            ds = xr.open_dataset(path1)
+
+            time_mask = (
+                (ds.time.dt.month == 8) &
+                (ds.time.dt.day >= 11) &
+                (ds.time.dt.day <= 20)
+            )
+
+            data1 = data1[:, time_mask.values]
+            data2 = data2[:, time_mask.values]
+
+            all_var1.append(data1)
+            all_var2.append(data2)
+
+        except Exception as e:
+            logger.error(f"{year} failed: {e}")
+
+    var1_mean, var1_std = compute_mean_std(all_var1)
+    var2_mean, var2_std = compute_mean_std(all_var2)
+
+    return var1_mean, var1_std, var2_mean, var2_std
+
+
+# =============================
+# Build predictors
+# =============================
+
+def build_samples(years, dir1, dir2,
+                  lat_min, lat_max, lon_min, lon_max,
+                  var1_mean, var1_std,
+                  var2_mean, var2_std):
+
+    samples = []
+
+    example_file = os.path.join(dir1, str(years[0]),
+                                f"model_{years[0]}_var1.nc")
+
+    ds_example = xr.open_dataset(example_file).sel(
+        latitude=slice(lat_max, lat_min),
+        longitude=slice(lon_min, lon_max)
+    )
+
+    lat = ds_example.latitude.values
+    lon = ds_example.longitude.values
+
+    for year in tqdm(years, desc="Building samples"):
+
+        path1 = os.path.join(dir1, str(year), f"model_{year}_var1.nc")
+        path2 = os.path.join(dir2, str(year), f"model_{year}_var2.nc")
+
+        if not os.path.exists(path1) or not os.path.exists(path2):
+            continue
+
+        try:
+
+            data1 = load_and_crop(path1, "var1",
+                                  lat_min, lat_max, lon_min, lon_max)
+
+            data2 = load_and_crop(path2, "var2",
+                                  lat_min, lat_max, lon_min, lon_max)
+
+            ds = xr.open_dataset(path1)
+
+            time_mask = (
+                (ds.time.dt.month == 8) &
+                (ds.time.dt.day >= 11) &
+                (ds.time.dt.day <= 20)
+            )
+
+            data1 = data1[:, time_mask.values]
+            data2 = data2[:, time_mask.values]
+
+            mean1 = data1.mean(axis=(0, 1))
+            mean2 = data2.mean(axis=(0, 1))
+
+            norm1 = (mean1 - var1_mean) / var1_std
+            norm2 = (mean2 - var2_mean) / var2_std
+
+            samples.append(np.stack([norm1, norm2], axis=0))
+
+        except Exception as e:
+            logger.error(f"{year} failed: {e}")
+
+    samples = np.array(samples)
+
+    samples = np.mean(samples, axis=2)
+
+    samples = np.transpose(samples, (1, 0, 2, 3))
+
+    overall_mean = np.mean(samples)
+    overall_std = np.std(samples)
+
+    samples = (samples - overall_mean) / overall_std
+
+    return samples, lat, lon
+
+
+# =============================
+# Main
+# =============================
+
+def main():
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--data_dir", default="./data")
+    parser.add_argument("--output_dir", default="./output")
+
+    parser.add_argument("--start_year", type=int, default=year1)
+    parser.add_argument("--end_year", type=int, default=year2)
+
+    parser.add_argument("--lat_min", type=float, default=lat1)
+    parser.add_argument("--lat_max", type=float, default=lat2)
+
+    parser.add_argument("--lon_min", type=float, default=lon1)
+    parser.add_argument("--lon_max", type=float, default=lon2)
+
+    args = parser.parse_args()
+
+    years = list(range(args.start_year, args.end_year + 1))
+
+    dir1 = os.path.join(args.data_dir, "var1")
+    dir2 = os.path.join(args.data_dir, "var2")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    logger.info("Computing climatology")
+
+    var1_mean, var1_std, var2_mean, var2_std = compute_climatology(
+        years, dir1, dir2,
+        args.lat_min, args.lat_max,
+        args.lon_min, args.lon_max
+    )
+
+    logger.info("Building predictors")
+
+    samples, lat, lon = build_samples(
+        years, dir1, dir2,
+        args.lat_min, args.lat_max,
+        args.lon_min, args.lon_max,
+        var1_mean, var1_std,
+        var2_mean, var2_std
+    )
+
+    output_nc = os.path.join(args.output_dir, "predictors.nc")
+    output_npz = os.path.join(args.output_dir, "zscore_stats.npz")
+
+    ds = xr.Dataset(
+        {
+            "predictor": (
+                ["variable", "sample", "lat", "lon"],
+                samples.astype(np.float32)
+            )
+        },
+        coords={
+            "variable": ["var1", "var2"],
+            "sample": np.arange(samples.shape[1]),
+            "lat": lat,
+            "lon": lon,
+        }
+    )
+
+    ds.to_netcdf(output_nc)
+
+    np.savez(
+        output_npz,
+        var1_mean=var1_mean,
+        var1_std=var1_std,
+        var2_mean=var2_mean,
+        var2_std=var2_std
+    )
+
+    logger.info(f"Saved predictors to {output_nc}")
+    logger.info(f"Saved normalization parameters to {output_npz}")
+
+
+if __name__ == "__main__":
+    main()
